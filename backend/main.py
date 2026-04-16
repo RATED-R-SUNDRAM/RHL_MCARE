@@ -1,19 +1,24 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from backend.schemas import ChatRequest, ChatResponse, SessionInfo, ResultsSummary
-from backend.database import init_db, get_or_create_user, get_user_session, get_db_connection
+from backend.database import (
+    init_db,
+    get_or_create_user,
+    get_user_session,
+    get_db_connection,
+    save_completed_questionnaire
+)
 from backend.gemini_integration import (
-    parse_response_with_gemini, 
     get_severity_level,
     get_recommendations,
-    get_question,
     format_question_with_options,
-    QUESTIONNAIRES
+    orchestrate_flow
 )
 from backend.utils import (
     save_response,
     update_tracker_progress,
     get_tracker,
+    get_recent_history,
     get_session_scores,
     get_risk_flags,
     save_score,
@@ -21,12 +26,65 @@ from backend.utils import (
     calculate_questionnaire_score,
     end_session,
     update_session_state,
-    get_session_data,
     get_session_responses,
     option_to_score
 )
 import time
 import logging
+
+# Support video links for moderate scores
+ANXIETY_SUPPORT_VIDEO = "https://rhlaiservice2.blob.core.windows.net/mcare/anxiety/Anxiety-coping.m3u8"
+DEPRESSION_SUPPORT_VIDEO = "https://rhlaiservice2.blob.core.windows.net/mcare/depression/depression.m3u8"
+SUICIDE_SUPPORT_VIDEO = "https://rhlaiservice2.blob.core.windows.net/mcare/suicide/suicide.m3u8"
+
+# Self-help guidelines
+ANXIETY_SELF_HELP = """
+Anxiety may sometimes seem random; but there is usually an underlying cause related to genetics, brain function, or co-occurring health conditions. Professional help can assist in uncovering these deeper factors. Symptoms of anxiety can be triggered or worsened by specific factors such as caffeine, certain medications, financial concerns, and stress.
+
+You can identify personal triggers by journaling, therapy, and self-reflection.
+
+Techniques to Help Overcome Anxiety
+Effective coping strategies to manage anxiety include:
+1. Grounding: A technique to feel calm by engaging in your current environment.
+   • Name 3 things you see.
+   • Identify 3 sounds you hear.
+   • Move or touch 3 things (e.g., your limbs or objects).
+2. Breathing Exercises: Take a deep breath, hold for 2-5 seconds, and then breathe out.
+3. Meditation: Practice re-centering your body and mind.
+4. Massage: Helps ease physical tension.
+
+If these techniques are not effective, or for underlying causes, seek professional help from a health care professional.
+"""
+
+DEPRESSION_SELF_HELP = """
+Depression is a common condition which is like a passing mood or a day of feeling down. It can be managed using the following strategies:
+1. Challenge negative thoughts by replacing them with balanced ones. Identify negative thoughts like "I’m worthless" and replace them with balanced ones like "I’m struggling, but that doesn’t mean I’m worthless."
+2. Engage in small, meaningful activities like taking a walk, regular exercise, etc.
+3. Maintaining a healthy routine (consistent sleep/meals). Go to bed and wake up at the same time daily; avoid screens before bed.
+4. Break problems into smaller, manageable parts instead of feeling overwhelmed.
+5. Write down 2–3 things you’re thankful for each day.
+6. Isolation makes depression worse; connecting with friends, family or support groups helps to lighten your thoughts.
+7. Limit the use of alcohol and caffeine.
+
+If you feel that you cannot cope with the symptoms, seek professional help: A doctor, psychologist, or counselor can provide support and treatment options.
+"""
+
+SUICIDE_SELF_HELP = """
+When suicidal thoughts come, they often feel overwhelming and permanent. However, there are coping strategies that can help you to connect with the present.
+1. Ground Yourself in the Present: Use the 5-4-3-2-1 technique (seeing, touching, hearing, smelling, tasting) to reconnect to the here and now when thoughts feel overwhelming.
+2. Hold something comforting like a soft object or a pet.
+3. A written safety plan can guide you when you’re in crisis. It usually includes:
+   Warning signs: What thoughts, feelings, or behaviors tell me I’m in danger?
+   Coping strategies: What can I do right now to feel safer (walk, breathe, music, call a friend)?
+   Safe spaces or distractions: Where can I go or what can I do that feels calming (a park, my room, faith community)?
+   People I can contact include friend/family, Counselor, Helpline.
+   Remove or avoid anything that you could use to harm yourself.
+4. Reach out immediately to a trusted person (call, text, or write) as isolation fuels suicidal thinking. Send a simple message like, "I'm not okay right now. Can we talk?"
+5. Listen to calming music or pray, meditate, or read a meaningful passage.
+6. Try challenging hopeless thoughts like "I can’t handle this" to "I’ve handled hard things before, even when I didn’t think I could."
+7. When you’re in crisis, it’s easy to forget why life matters. Write a list of things, big or small, that have meaning to you like people who care about you, dreams or goals you haven’t yet tried, pets, nature, music, kindness, faith, learning - anything that sparks life. Keep this list somewhere you can reach for it when you feel low.
+8. Get Professional Support
+"""
 
 # Setup logging for latency tracking
 logging.basicConfig(level=logging.INFO)
@@ -47,438 +105,236 @@ init_db()
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    """Main chat endpoint - processes user message and returns next question"""
+    """Main chat endpoint - processes user message through centralized orchestrator"""
     request_start = time.time()
-    
+
     user_id = request.user_id.strip()
     message = request.message.strip()
-    
+
     if not user_id or not message:
         raise HTTPException(status_code=400, detail="user_id and message required")
-    
-    # CHECKPOINT 1: User & Session Setup
-    setup_start = time.time()
+
     get_or_create_user(user_id)
     session = get_user_session(user_id)
     session_id = session['session_id']
-    tracker = get_tracker(session_id)
+    trackers = get_tracker(session_id)
     current_state = session['current_state']
-    logger.info(f"[SETUP] {time.time() - setup_start:.3f}s | State: {current_state} | Progress: {tracker.get('phq4_progress', -1)}")
-    
-    # ==================== INITIAL OFFER ====================
-    if current_state == "PHQ4" and tracker['phq4_progress'] == 0 and message.lower() not in ["a", "b", "c", "d"]:
-        if message.lower() in ["yes", "ok", "start", "y", "take test"]:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute("UPDATE trackers SET phq4_progress = -1 WHERE session_id = ?", (session_id,))
-            conn.commit()
-            conn.close()
-            
-            return ChatResponse(
-                session_id=session_id,
-                current_state="PHQ4",
-                next_question=f"**Question 1 of 4 - PHQ-4 Screening**\n\n{format_question_with_options('PHQ4', 0)}",
-                question_number=1,
-                total_questions=4,
-                progress_message="Starting PHQ-4 Screening"
-            )
-        elif message.lower() in ["no", "n", "skip"]:
-            end_session(session_id)
-            return ChatResponse(
-                session_id=session_id,
-                current_state="COMPLETED",
-                next_question="Thank you for visiting. You can restart anytime.",
-                question_number=0,
-                total_questions=0,
-                progress_message="Session ended"
-            )
-        else:
-            return ChatResponse(
-                session_id=session_id,
-                current_state="PHQ4",
-                next_question="Would you like to take a mental health assessment? Please respond with **Yes** or **No**",
-                question_number=0,
-                total_questions=4,
-                progress_message="Awaiting assessment decision",
-                clarification_needed=True,
-                clarification_prompt="Please answer 'Yes' or 'No'"
-            )
-    
-    # ==================== HANDLE PHQ4 ====================
-    if current_state == "PHQ4" and tracker['phq4_progress'] >= -1 and tracker['phq4_progress'] < 4:
-        # CHECKPOINT 2: Gemini Parse (LATENCY HOTSPOT)
-        parse_start = time.time()
-        parse_result = parse_response_with_gemini(
-            "PHQ4", 
-            tracker['phq4_progress'] if tracker['phq4_progress'] >= 0 else 0,
-            message
-        )
-        logger.info(f"[GEMINI_PARSE] {time.time() - parse_start:.3f}s | Confidence: {parse_result.get('confidence')}")
-        
-        # OFF-TOPIC: User not answering the question
-        if parse_result.get('is_offtopic'):
-            question_idx = tracker['phq4_progress'] if tracker['phq4_progress'] >= 0 else 0
-            return ChatResponse(
-                session_id=session_id,
-                current_state="PHQ4",
-                next_question=f"I appreciate your comment, but let's focus on the assessment. Please answer:\n\n**Question {question_idx + 1} of 4 - PHQ-4**\n\n{format_question_with_options('PHQ4', question_idx)}",
-                question_number=question_idx + 1,
-                total_questions=4,
-                progress_message=f"Question {question_idx + 1} of 4 - Please answer the question",
-                clarification_needed=True,
-                clarification_prompt="Please choose: a, b, c, or d"
-            )
-        
-        # LOW CONFIDENCE: Unclear response
-        if parse_result.get('confidence') == 'low':
-            question_idx = tracker['phq4_progress'] if tracker['phq4_progress'] >= 0 else 0
-            return ChatResponse(
-                session_id=session_id,
-                current_state="PHQ4",
-                next_question=f"I didn't quite understand. Could you choose one of the options?\n\n**Question {question_idx + 1} of 4 - PHQ-4**\n\n{format_question_with_options('PHQ4', question_idx)}",
-                question_number=question_idx + 1,
-                total_questions=4,
-                progress_message=f"Question {question_idx + 1} of 4 - Clarification needed",
-                clarification_needed=True,
-                clarification_prompt="Please choose an option: a, b, c, or d"
-            )
-        
-        # MEDIUM CONFIDENCE: Ask for confirmation
-        if parse_result.get('confidence') == 'medium' and parse_result.get('ask_confirm'):
-            question_idx = tracker['phq4_progress'] if tracker['phq4_progress'] >= 0 else 0
-            return ChatResponse(
-                session_id=session_id,
-                current_state="PHQ4",
-                next_question=f"Just to confirm: Did you mean **option {parse_result['option'].upper()}** - *{QUESTIONNAIRES['PHQ4']['options'][parse_result['option']]}*?",
-                question_number=question_idx + 1,
-                total_questions=4,
-                progress_message=f"Question {question_idx + 1} of 4 - Confirm",
-                clarification_needed=True
-            )
-        
-        # HIGH CONFIDENCE: Save response
-        option = parse_result.get('option', 'a').lower()
-        score = option_to_score(option)
-        
+    recent_history = get_recent_history(session_id, limit=5)
+
+    orch_result = orchestrate_flow(message, current_state, trackers, recent_history, session_id, user_id)
+    logger.log(logging.INFO, f"Orchestrator result: {orch_result}")
+    action = orch_result.get('action', 'CLARIFY')
+    questionnaire = orch_result.get('questionnaire')
+    question_number = orch_result.get('question_number', 0)
+    interpreted_option = orch_result.get('interpreted_option')
+    confidence = orch_result.get('confidence', 'low')
+    next_message = orch_result.get('next_message', '')
+    update_progress = orch_result.get('update_progress', False)
+    complete_questionnaire = orch_result.get('complete_questionnaire', False)
+
+    if action in ["UPDATE_STATUS", "COMPLETE_ASSESSMENT"] and questionnaire and interpreted_option:
+        score = option_to_score(interpreted_option)
         if score < 0:
             raise HTTPException(status_code=400, detail="Invalid option")
-        
-        question_idx = tracker['phq4_progress'] if tracker['phq4_progress'] >= 0 else 0
-        
-        save_response(
-            session_id,
-            "PHQ4",
-            question_idx,
-            score,
-            message,
-            parse_result.get('confidence', 'unknown')
-        )
-        logger.info(f"[DB_SAVE] Saved response for PHQ4 Q{question_idx+1}")
-        
-        # UPDATE PROGRESS: Set to 1 after first answer (not 0!)
-        if tracker['phq4_progress'] == -1:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute("UPDATE trackers SET phq4_progress = 1 WHERE session_id = ?", (session_id,))
-            conn.commit()
-            conn.close()
-        else:
-            update_tracker_progress(session_id, "PHQ4")
-        
+
+        save_response(session_id, questionnaire, question_number, score, message, confidence)
+        if update_progress:
+            update_tracker_progress(session_id, questionnaire)
+
         tracker = get_tracker(session_id)
-        
-        # CHECK IF COMPLETE
-        if tracker['phq4_progress'] == 4:
-            # CHECKPOINT 4: Score Calculation
-            calc_start = time.time()
-            phq4_score = calculate_questionnaire_score(session_id, "PHQ4")
-            phq4_severity = get_severity_level("PHQ4", phq4_score)
-            save_score(session_id, "PHQ4", phq4_score, phq4_severity)
-            logger.info(f"[CALC_SCORE] {time.time() - calc_start:.3f}s | Score: {phq4_score}/{QUESTIONNAIRES['PHQ4']}")
-            
-            responses = get_session_responses(session_id, "PHQ4")
-            anxiety_score = responses[0] + responses[1]
-            depression_score = responses[2] + responses[3]
-            
-            gad7_needed = anxiety_score >= 3
-            phq9_needed = depression_score >= 3
-            
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE trackers SET gad7_needed = ?, phq9_needed = ? WHERE session_id = ?",
-                (int(gad7_needed), int(phq9_needed), session_id)
-            )
-            conn.commit()
-            conn.close()
-            
-            # Generate intelligent summary message
-            summary = f"✅ **Thank you for your responses!**\n\n"
-            
-            if phq4_score <= 2:
-                summary += "**Good news:** Your screening shows minimal symptoms. You're doing well! Continue with your healthy habits and self-care practices.\n\n"
-            elif phq4_score <= 5:
-                summary += f"**Assessment:** You appear to have some mild symptoms. A more detailed assessment can help understand better.\n\n"
-            else:
-                summary += f"**Assessment:** Your responses suggest notable symptoms that deserve attention.\n\n"
-            
-            summary += f"**Your PHQ-4 Score:** {phq4_score}/12 ({phq4_severity})\n\n"
-            
-            # Determine next steps
-            if gad7_needed and phq9_needed:
-                summary += "📋 **Next Steps:** Would you like to answer questions about **anxiety** and **depression** for a complete assessment?\n\nThis will take about 5 minutes and give us a clearer picture."
-                next_state = "PHQ4_RESULTS_BOTH"
-            elif gad7_needed:
-                summary += "📋 **Next Steps:** It seems anxiety might be a concern. Would you like to answer more detailed questions about **anxiety**?\n\nThis will take about 2 minutes."
-                next_state = "PHQ4_RESULTS_GAD7"
-            elif phq9_needed:
-                summary += "📋 **Next Steps:** It seems depression might be a concern. Would you like to answer more detailed questions about **depression**?\n\nThis will take about 3 minutes."
-                next_state = "PHQ4_RESULTS_PHQ9"
-            else:
-                summary += "Your assessment is complete. Thank you for participating!"
-                update_session_state(session_id, "COMPLETED")
-                end_session(session_id)
-                return ChatResponse(
-                    session_id=session_id,
-                    current_state="COMPLETED",
-                    next_question=summary,
-                    question_number=0,
-                    total_questions=0,
-                    progress_message="Assessment Complete"
+        max_questions_by_questionnaire = {"PHQ4": 4, "GAD7": 7, "PHQ9": 9}
+        is_complete = False
+        if questionnaire in max_questions_by_questionnaire:
+            current_progress = tracker.get(f"{questionnaire.lower()}_progress", 0)
+            if current_progress >= max_questions_by_questionnaire[questionnaire] or question_number + 1 >= max_questions_by_questionnaire[questionnaire]:
+                is_complete = True
+
+        session_closed = False
+        if is_complete or action == "COMPLETE_ASSESSMENT":
+            total_score = calculate_questionnaire_score(session_id, questionnaire)
+            severity = get_severity_level(questionnaire, total_score)
+            save_score(session_id, questionnaire, total_score, severity)
+            save_completed_questionnaire(user_id, questionnaire, get_session_responses(session_id, questionnaire))
+
+            if questionnaire == "PHQ4":
+                responses = get_session_responses(session_id, "PHQ4")
+                anxiety_score = sum(responses[:2]) if len(responses) >= 2 else 0
+                depression_score = sum(responses[2:4]) if len(responses) >= 4 else 0
+                gad7_needed = 1 if anxiety_score >= 2 else 0
+                phq9_needed = 1 if depression_score >= 2 else 0
+
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE trackers SET gad7_needed = ?, phq9_needed = ? WHERE session_id = ?",
+                    (gad7_needed, phq9_needed, session_id)
                 )
-            
-            # Update to results state (waiting for user permission)
-            update_session_state(session_id, next_state)
-            logger.info(f"[STATE_CHANGE] PHQ4 → {next_state}")
-            
-            return ChatResponse(
-                session_id=session_id,
-                current_state=next_state,
-                next_question=summary,
-                question_number=0,
-                total_questions=0,
-                progress_message="Awaiting user permission to continue",
-                clarification_needed=True,
-                clarification_prompt="Reply 'yes' to continue or 'no' to end"
-            )
-        else:
-            question_idx = tracker['phq4_progress']
-            return ChatResponse(
-                session_id=session_id,
-                current_state="PHQ4",
-                next_question=f"**Question {question_idx + 1} of 4 - PHQ-4**\n\n{format_question_with_options('PHQ4', question_idx)}",
-                question_number=question_idx + 1,
-                total_questions=4,
-                progress_message=f"Question {question_idx + 1} of 4"
-            )
-    
-    # ==================== HANDLE PHQ4 RESULTS STATES (Waiting for permission) ====================
-    if current_state in ["PHQ4_RESULTS_BOTH", "PHQ4_RESULTS_GAD7", "PHQ4_RESULTS_PHQ9"]:
-        if message.lower() in ["yes", "y", "ok", "start"]:
-            # User agreed - transition to appropriate questionnaire
-            if current_state == "PHQ4_RESULTS_BOTH":
-                # Start with GAD7 first
-                update_session_state(session_id, "GAD7")
-                logger.info(f"[USER_CONSENT] {user_id} agreed to GAD7+PHQ9")
-                return ChatResponse(
-                    session_id=session_id,
-                    current_state="GAD7",
-                    next_question=f"**GAD-7 Assessment: Anxiety Screening (7 questions)**\n\n**Question 1 of 7 - GAD-7**\n\n{format_question_with_options('GAD7', 0)}",
-                    question_number=1,
-                    total_questions=7,
-                    progress_message="Starting GAD-7 Assessment"
-                )
-            elif current_state == "PHQ4_RESULTS_GAD7":
-                update_session_state(session_id, "GAD7")
-                logger.info(f"[USER_CONSENT] {user_id} agreed to GAD7 only")
-                return ChatResponse(
-                    session_id=session_id,
-                    current_state="GAD7",
-                    next_question=f"**GAD-7 Assessment: Anxiety Screening (7 questions)**\n\n**Question 1 of 7 - GAD-7**\n\n{format_question_with_options('GAD7', 0)}",
-                    question_number=1,
-                    total_questions=7,
-                    progress_message="Starting GAD-7 Assessment"
-                )
-            else:  # PHQ4_RESULTS_PHQ9
-                update_session_state(session_id, "PHQ9")
-                logger.info(f"[USER_CONSENT] {user_id} agreed to PHQ9 only")
-                return ChatResponse(
-                    session_id=session_id,
-                    current_state="PHQ9",
-                    next_question=f"**PHQ-9 Assessment: Depression Screening (9 questions)**\n\n**Question 1 of 9 - PHQ-9**\n\n{format_question_with_options('PHQ9', 0)}",
-                    question_number=1,
-                    total_questions=9,
-                    progress_message="Starting PHQ-9 Assessment"
-                )
-        elif message.lower() in ["no", "n", "skip", "end"]:
-            # User declined
-            update_session_state(session_id, "COMPLETED")
-            end_session(session_id)
-            logger.info(f"[USER_DECLINED] {user_id} declined further assessment")
-            return ChatResponse(
-                session_id=session_id,
-                current_state="COMPLETED",
-                next_question="Thank you for completing the PHQ-4 assessment. Your results have been saved. Feel free to return anytime for a complete assessment.",
-                question_number=0,
-                total_questions=0,
-                progress_message="Session ended by user"
-            )
-        else:
-            # Repeat the permission request
-            return ChatResponse(
-                session_id=session_id,
-                current_state=current_state,
-                next_question="Please reply **'yes'** to continue with the assessment or **'no'** to finish.",
-                question_number=0,
-                total_questions=0,
-                progress_message="Awaiting response",
-                clarification_needed=True,
-                clarification_prompt="Reply 'yes' or 'no'"
-            )
-    
-    # ==================== HANDLE GAD7 ====================
-    if current_state == "GAD7" and tracker['gad7_progress'] < 7:
-        parse_start = time.time()
-        parse_result = parse_response_with_gemini("GAD7", tracker['gad7_progress'], message)
-        logger.info(f"[GEMINI_PARSE] {time.time() - parse_start:.3f}s | GAD7")
-        
-        if parse_result.get('is_offtopic') or parse_result.get('confidence') == 'low':
-            return ChatResponse(
-                session_id=session_id,
-                current_state="GAD7",
-                next_question=f"Please focus on the question. Choose one option:\n\n**Question {tracker['gad7_progress'] + 1} of 7 - GAD-7**\n\n{format_question_with_options('GAD7', tracker['gad7_progress'])}",
-                question_number=tracker['gad7_progress'] + 1,
-                total_questions=7,
-                progress_message=f"Question {tracker['gad7_progress'] + 1} of 7",
-                clarification_needed=True,
-                clarification_prompt="Please choose: a, b, c, or d"
-            )
-        
-        option = parse_result.get('option', 'a').lower()
-        score = option_to_score(option)
-        save_response(session_id, "GAD7", tracker['gad7_progress'], score, message, parse_result.get('confidence'))
-        update_tracker_progress(session_id, "GAD7")
-        tracker = get_tracker(session_id)
-        
-        if tracker['gad7_progress'] == 7:
-            score_start = time.time()
-            gad7_score = calculate_questionnaire_score(session_id, "GAD7")
-            logger.info(f"[SCORE_CALC] {time.time() - score_start:.3f}s | GAD7 score={gad7_score}")
-            gad7_severity = get_severity_level("GAD7", gad7_score)
-            save_score(session_id, "GAD7", gad7_score, gad7_severity)
-            
-            if tracker['phq9_needed']:
-                update_session_state(session_id, "PHQ9")
-                return ChatResponse(
-                    session_id=session_id,
-                    current_state="PHQ9",
-                    next_question=f"✅ **GAD-7 Complete** (Score: {gad7_score}/21 - {gad7_severity})\n\n---\n\n**Starting PHQ-9 Assessment (9 questions)**\n\n**Question 1 of 9 - PHQ-9**\n\n{format_question_with_options('PHQ9', 0)}",
-                    question_number=1,
-                    total_questions=9,
-                    progress_message="Starting PHQ-9 Assessment"
-                )
-            else:
-                update_session_state(session_id, "COMPLETED")
-                end_session(session_id)
-                recommendations = get_recommendations("GAD7", gad7_score, gad7_severity)
-                return ChatResponse(
-                    session_id=session_id,
-                    current_state="COMPLETED",
-                    next_question=f"✅ **Assessment Complete!**\n\n**GAD-7 Score: {gad7_score}/21 ({gad7_severity})**\n\n💡 **Recommendations:**\n" + "\n".join([f"• {r}" for r in recommendations]),
-                    question_number=0,
-                    total_questions=0,
-                    progress_message="Assessment Complete"
-                )
-        else:
-            return ChatResponse(
-                session_id=session_id,
-                current_state="GAD7",
-                next_question=f"**Question {tracker['gad7_progress'] + 1} of 7 - GAD-7**\n\n{format_question_with_options('GAD7', tracker['gad7_progress'])}",
-                question_number=tracker['gad7_progress'] + 1,
-                total_questions=7,
-                progress_message=f"Question {tracker['gad7_progress'] + 1} of 7"
-            )
-    
-    # ==================== HANDLE PHQ9 ====================
-    if current_state == "PHQ9" and tracker['phq9_progress'] < 9:
-        parse_start = time.time()
-        parse_result = parse_response_with_gemini("PHQ9", tracker['phq9_progress'], message)
-        logger.info(f"[GEMINI_PARSE] {time.time() - parse_start:.3f}s | PHQ9")
-        
-        if parse_result.get('is_offtopic') or parse_result.get('confidence') == 'low':
-            return ChatResponse(
-                session_id=session_id,
-                current_state="PHQ9",
-                next_question=f"Please focus on the question. Choose one option:\n\n**Question {tracker['phq9_progress'] + 1} of 9 - PHQ-9**\n\n{format_question_with_options('PHQ9', tracker['phq9_progress'])}",
-                question_number=tracker['phq9_progress'] + 1,
-                total_questions=9,
-                progress_message=f"Question {tracker['phq9_progress'] + 1} of 9",
-                clarification_needed=True,
-                clarification_prompt="Please choose: a, b, c, or d"
-            )
-        
-        option = parse_result.get('option', 'a').lower()
-        score = option_to_score(option)
-        save_response(session_id, "PHQ9", tracker['phq9_progress'], score, message, parse_result.get('confidence'))
-        update_tracker_progress(session_id, "PHQ9")
-        tracker = get_tracker(session_id)
-        
-        if tracker['phq9_progress'] == 9:
-            score_start = time.time()
-            phq9_score = calculate_questionnaire_score(session_id, "PHQ9")
-            logger.info(f"[SCORE_CALC] {time.time() - score_start:.3f}s | PHQ9 score={phq9_score}")
-            phq9_severity = get_severity_level("PHQ9", phq9_score)
-            save_score(session_id, "PHQ9", phq9_score, phq9_severity)
-            
-            responses = get_session_responses(session_id, "PHQ9")
-            q9_score = responses[8]
-            
-            if q9_score > 0:
-                save_risk_flag(session_id, "suicide_ideation", f"Q9 score: {q9_score}")
-                update_session_state(session_id, "COMPLETED")
-                end_session(session_id)
-                
-                resources = "🚨 **IMPORTANT - Suicide Risk Detected**\n\nIf you're having suicidal thoughts:\n"
-                resources += "• **National Suicide Prevention Lifeline (US):** 988\n"
-                resources += "• **Crisis Text Line:** Text HOME to 741741\n"
-                resources += "• **International Association for Suicide Prevention:** https://www.iasp.info/resources/Crisis_Centres/\n\n"
-                resources += "**Please reach out to a mental health professional or emergency services immediately.**"
-                
-                return ChatResponse(
-                    session_id=session_id,
-                    current_state="COMPLETED",
-                    next_question=f"✅ **Assessment Complete**\n\n**PHQ-9 Score: {phq9_score}/27 ({phq9_severity})\n\n{resources}",
-                    question_number=0,
-                    total_questions=0,
-                    progress_message="Assessment Complete - Suicide Risk Detected"
-                )
-            else:
-                update_session_state(session_id, "COMPLETED")
-                end_session(session_id)
-                recommendations = get_recommendations("PHQ9", phq9_score, phq9_severity)
-                return ChatResponse(
-                    session_id=session_id,
-                    current_state="COMPLETED",
-                    next_question=f"✅ **Assessment Complete!**\n\n**PHQ-9 Score: {phq9_score}/27 ({phq9_severity})**\n\n💡 **Recommendations:**\n" + "\n".join([f"• {r}" for r in recommendations]),
-                    question_number=0,
-                    total_questions=0,
-                    progress_message="Assessment Complete"
-                )
-        else:
-            return ChatResponse(
-                session_id=session_id,
-                current_state="PHQ9",
-                next_question=f"**Question {tracker['phq9_progress'] + 1} of 9 - PHQ-9**\n\n{format_question_with_options('PHQ9', tracker['phq9_progress'])}",
-                question_number=tracker['phq9_progress'] + 1,
-                total_questions=9,
-                progress_message=f"Question {tracker['phq9_progress'] + 1} of 9"
-            )
-    
+                conn.commit()
+                conn.close()
+
+                if gad7_needed or phq9_needed:
+                    update_session_state(session_id, "PHQ4_RESULTS")
+                    if not next_message or next_message == "Thank you. Let's continue.":
+                        follow_up = []
+                        if gad7_needed:
+                            follow_up.append("anxiety")
+                        if phq9_needed:
+                            follow_up.append("mood")
+                        follow_up_text = " and ".join(follow_up)
+                        next_message = (
+                            f"✅ **PHQ-4 Complete** (Score: {total_score}/12 - {severity})\n\n"
+                            f"Thanks for completing the first screening. If you have any questions about these results, feel free to ask now. "
+                            f"Otherwise, I recommend taking the PHQ-4 again periodically or continuing with follow-up questions about {follow_up_text}. "
+                            "Would you like to continue?"
+                        )
+                else:
+                    update_session_state(session_id, "COMPLETED")
+                    end_session(session_id)
+                    next_message = (
+                        f"✅ **PHQ-4 Complete** (Score: {total_score}/12 - {severity})\n\n"
+                        "Your screening does not indicate further follow-up questions right now. "
+                        "If you want, you can review the results again later."
+                    )
+                    session_closed = True
+
+            elif questionnaire == "GAD7":
+                tracker = get_tracker(session_id)
+                if total_score <= 4:
+                    supportive_note = "You’re doing well. Keep up the good work and lead a stress-free life."
+                elif total_score <= 9:
+                    supportive_note = (
+                        f"Take care. This short support video may help you manage anxiety: {ANXIETY_SUPPORT_VIDEO}\n\n"
+                        f"**Self-help guidelines for anxiety:**\n{ANXIETY_SELF_HELP}"
+                    )
+                else:
+                    supportive_note = (
+                        "Scores above 9 should indicate signs of anxiety and the person is asked to seek professional help. "
+                        "I’m sorry you’re feeling this way. It may help to reach out to a mental health expert for support. "
+                        "You deserve caring help."
+                    )
+
+                if tracker.get('phq9_needed'):
+                    update_session_state(session_id, "PHQ9")
+                    next_message = (
+                        f"✅ **GAD-7 Complete** (Score: {total_score}/21 - {severity})\n\n"
+                        f"{supportive_note}\n\n"
+                        "I’ve recorded your anxiety responses. Now I have one more set of questions about how you're feeling emotionally.\n\n"
+                        "**Question 1 of 9**\n\n"
+                        f"{format_question_with_options('PHQ9', 0)}"
+                    )
+                    question_number = 0
+                else:
+                    update_session_state(session_id, "COMPLETED")
+                    end_session(session_id)
+                    next_message = (
+                        f"✅ **GAD-7 Complete** (Score: {total_score}/21 - {severity})\n\n"
+                        f"{supportive_note}"
+                    )
+                    session_closed = True
+
+            elif questionnaire == "PHQ9":
+                responses = get_session_responses(session_id, "PHQ9")
+                q9_score = responses[8] if len(responses) > 8 else 0
+                if q9_score > 0:
+                    save_risk_flag(session_id, "suicide_ideation", f"Q9 score: {q9_score}")
+                    update_session_state(session_id, "COMPLETED")
+                    end_session(session_id)
+
+                    resources = "🚨 **IMPORTANT - Suicide Risk Detected**\n\nIf you're having suicidal thoughts:\n"
+                    resources += "• **National Suicide Prevention Lifeline (US):** 988\n"
+                    resources += "• **Crisis Text Line:** Text HOME to 741741\n"
+                    resources += "• **International Association for Suicide Prevention:** https://www.iasp.info/resources/Crisis_Centres/\n\n"
+                    resources += f"**For coping strategies, see this video:** {SUICIDE_SUPPORT_VIDEO}\n\n"
+                    resources += f"**Self-help guidelines for suicide:**\n{SUICIDE_SELF_HELP}\n\n"
+                    resources += "**Please reach out to a mental health professional or emergency services immediately.**"
+
+                    next_message = (
+                        f"✅ **PHQ-9 Complete** (Score: {total_score}/27 - {severity})\n\n"
+                        f"{resources}"
+                    )
+                    session_closed = True
+                else:
+                    if total_score >= 10:
+                        conn = get_db_connection()
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            "UPDATE trackers SET gad7_needed = ?, phq4_needed = ? WHERE session_id = ?",
+                            (1, 1, session_id)
+                        )
+                        conn.commit()
+                        conn.close()
+
+                    if total_score <= 4:
+                        supportive_note = "You’re doing well. Keep up the good work and lead a stress-free life."
+                    elif total_score <= 9:
+                        supportive_note = (
+                            f"Take care. This short support video may help you cope: {DEPRESSION_SUPPORT_VIDEO}\n\n"
+                            f"**Self-help guidelines for depression:**\n{DEPRESSION_SELF_HELP}"
+                        )
+                    else:
+                        supportive_note = (
+                            "Scores above 9 should indicate signs of major depressive disorder and the person is asked to seek professional help. "
+                            "I’m sorry you’re going through this. It could really help to reach out to a mental health expert for support. "
+                            "You’re not alone in this."
+                        )
+
+                    update_session_state(session_id, "COMPLETED")
+                    end_session(session_id)
+                    next_message = (
+                        f"✅ **PHQ-9 Complete** (Score: {total_score}/27 - {severity})\n\n"
+                        f"{supportive_note}"
+                    )
+                    session_closed = True
+
+            if session_closed:
+                pass
+
+    if action == "ASK_QUESTION" and questionnaire:
+        update_session_state(session_id, questionnaire)
+
+    if action == "UPDATE_STATUS" and questionnaire and update_progress and not complete_questionnaire:
+        update_session_state(session_id, questionnaire)
+        next_question_number = question_number + 1
+        next_message = f"""Thank you. Let's continue.
+
+**{questionnaire} Assessment**
+
+**Question {next_question_number + 1}**
+
+{format_question_with_options(questionnaire, next_question_number)}"""
+        question_number = next_question_number
+
+    if action == "ASK_QUESTION" and questionnaire and not next_message:
+        next_message = f"""**{questionnaire} Assessment**
+
+**Question {question_number + 1}**
+
+{format_question_with_options(questionnaire, question_number)}"""
+
+    if not next_message:
+        next_message = "I didn't understand that. Can you please clarify your response?"
+
+    session = get_user_session(user_id)
+    current_state = session['current_state']
+    total_questions = 0
+    if questionnaire == 'PHQ9':
+        total_questions = 9
+    elif questionnaire == 'GAD7':
+        total_questions = 7
+    elif questionnaire == 'PHQ4':
+        total_questions = 4
+
     total_time = time.time() - request_start
-    logger.warning(f"[TOTAL_REQUEST_TIME] {total_time:.3f}s | State: {current_state}")
-    raise HTTPException(status_code=400, detail="Invalid state")
+    logger.warning(f"[REQUEST_TIME] {total_time:.3f}s | Action: {action} | State: {current_state}")
 
-
+    return ChatResponse(
+        session_id=session_id,
+        current_state=current_state,
+        next_question=next_message,
+        question_number=question_number,
+        total_questions=total_questions,
+        progress_message=f"Action: {action}"
+    )
 @app.get("/results/{session_id}", response_model=ResultsSummary)
 async def get_results(session_id: int):
     """Get assessment results for a session"""

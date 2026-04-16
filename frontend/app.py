@@ -13,36 +13,84 @@ st.set_page_config(
 # Custom CSS for modern chatbot look
 st.markdown("""
 <style>
+    .app-header {
+        width: 100%;
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        padding: 18px 20px;
+        border-radius: 20px;
+        background: linear-gradient(135deg, #f7f9fc, #ffffff);
+        box-shadow: 0 12px 28px rgba(0,0,0,0.08);
+        margin-bottom: 20px;
+        position: sticky;
+        top: 0;
+        z-index: 999;
+    }
+    .header-item {
+        font-size: 0.95rem;
+        color: #2e3a59;
+        margin: 0;
+    }
+    .status-pill {
+        padding: 10px 16px;
+        border-radius: 999px;
+        display: inline-flex;
+        align-items: center;
+        font-weight: 600;
+        font-size: 0.95rem;
+    }
+    .status-pill.online {
+        background: #e6f4ea;
+        color: #166538;
+    }
+    .status-pill.offline {
+        background: #fce8e6;
+        color: #7f1d1d;
+    }
+    .chat-box {
+        border: 1px solid #e4e8ef;
+        border-radius: 20px;
+        background: #ffffff;
+        padding: 22px;
+        min-height: 460px;
+        max-height: 680px;
+        overflow-y: auto;
+        box-shadow: inset 0 0 0 1px rgba(58, 66, 86, 0.04);
+    }
     .user-message {
-        background-color: #007AFF;
+        background-color: #0d6efd;
         color: white;
-        padding: 12px 16px;
+        padding: 14px 18px;
         border-radius: 18px;
-        margin: 8px 0;
+        margin: 10px 0;
         margin-left: auto;
         width: fit-content;
-        max-width: 70%;
+        max-width: 72%;
         text-align: right;
+        word-break: break-word;
     }
     .bot-message {
-        background-color: #E9ECEF;
-        color: #000;
-        padding: 12px 16px;
+        background-color: #f1f5fb;
+        color: #1f2937;
+        padding: 14px 18px;
         border-radius: 18px;
-        margin: 8px 0;
+        margin: 10px 0;
         width: fit-content;
-        max-width: 70%;
+        max-width: 78%;
+        word-break: break-word;
     }
-    .chat-container {
-        display: flex;
-        flex-direction: column;
-        height: 500px;
+    .empty-chat {
+        color: #6b7280;
+        font-style: italic;
+        padding: 22px;
     }
-    .question-format {
-        font-weight: bold;
-        color: #1f77b4;
-        font-size: 16px;
-        margin-top: 10px;
+    .chat-title {
+        margin-bottom: 14px;
+        font-weight: 700;
+        font-size: 1.05rem;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -134,6 +182,16 @@ with st.sidebar:
 st.title("🧠 Mental Health Assessment Chatbot")
 st.markdown("Phased screening for anxiety, depression, and suicidal ideation")
 
+status_text = "✅ Connected to backend" if st.session_state.backend_available else "⚠️ Backend not connected"
+status_class = "status-pill online" if st.session_state.backend_available else "status-pill offline"
+st.markdown(f"""
+<div class="app-header">
+  <div class="header-item"><strong>User ID:</strong> {st.session_state.user_id or 'Not set'}</div>
+  <div class="header-item"><strong>Session ID:</strong> {st.session_state.session_id or '-'}</div>
+  <div class="{status_class}">{status_text}</div>
+</div>
+""", unsafe_allow_html=True)
+
 # User ID section
 col1, col2, col3 = st.columns([2, 1, 1])
 with col1:
@@ -180,19 +238,18 @@ if not st.session_state.user_id:
 
 # Chat history display
 st.markdown("### Conversation")
-chat_container = st.container(border=True, height=400)
-
-with chat_container:
-    if st.session_state.chat_history:
-        for msg in st.session_state.chat_history:
-            if msg["role"] == "user":
-                st.markdown(f'<div class="user-message">You: {msg["message"]}</div>', unsafe_allow_html=True)
-            else:
-                # Format bot message with proper markdown
-                bot_msg = msg["message"]
-                st.markdown(f'<div class="bot-message">{bot_msg}</div>', unsafe_allow_html=True)
-    else:
-        st.markdown("💬 *Chat will appear here*")
+chat_html = '<div class="chat-box">'
+if st.session_state.chat_history:
+    for msg in st.session_state.chat_history:
+        if msg["role"] == "user":
+            chat_html += f'<div class="user-message">You: {msg["message"]}</div>'
+        else:
+            bot_msg = msg["message"]
+            chat_html += f'<div class="bot-message">{bot_msg}</div>'
+else:
+    chat_html += '<div class="empty-chat">💬 Chat will appear here</div>'
+chat_html += '</div>'
+st.markdown(chat_html, unsafe_allow_html=True)
 
 # Input section
 st.markdown("### Your Response")

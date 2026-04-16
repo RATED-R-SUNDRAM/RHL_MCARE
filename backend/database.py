@@ -1,13 +1,22 @@
 import sqlite3
 import os
 from datetime import datetime
+import json
 
 DB_PATH = "mental_health.db"
+ARCHIVE_DB_PATH = "questionnaire_archive.db"
 
 
 def get_db_connection():
     """Create database connection with row factory for dict-like access"""
     conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def get_archive_db_connection():
+    """Create archive database connection with row factory for dict-like access"""
+    conn = sqlite3.connect(ARCHIVE_DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -95,7 +104,39 @@ def init_db():
 
     conn.commit()
     conn.close()
-    print(f"Database initialized at {DB_PATH}")
+
+    # Create separate archive database for completed questionnaires
+    archive_conn = get_archive_db_connection()
+    archive_cursor = archive_conn.cursor()
+    archive_cursor.execute("""
+        CREATE TABLE IF NOT EXISTS completed_questionnaires (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            year INTEGER,
+            month INTEGER,
+            date INTEGER,
+            time TEXT,
+            questionnaire TEXT,
+            responses TEXT,
+            completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    archive_conn.commit()
+    archive_conn.close()
+    print(f"Database initialized at {DB_PATH} and archive at {ARCHIVE_DB_PATH}")
+
+
+def get_last_completed_questionnaire(user_id: str, questionnaire: str):
+    """Return the most recent completed questionnaire for a user."""
+    conn = get_archive_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM completed_questionnaires WHERE user_id = ? AND questionnaire = ? ORDER BY completed_at DESC LIMIT 1",
+        (user_id, questionnaire)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
 
 
 def get_or_create_user(user_id: str):
@@ -137,7 +178,7 @@ def get_user_session(user_id: str):
     # Create new session
     cursor.execute(
         "INSERT INTO sessions (user_id, current_state) VALUES (?, ?)",
-        (user_id, "PHQ4")
+        (user_id, "PHQ4_PENDING")
     )
     session_id = cursor.lastrowid
     
@@ -156,6 +197,30 @@ def get_user_session(user_id: str):
     conn.close()
     
     return dict(new_session)
+
+
+def save_completed_questionnaire(user_id: str, questionnaire: str, responses: list):
+    """Save completed questionnaire to archive database"""
+    now = datetime.now()
+    conn = get_archive_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        INSERT INTO completed_questionnaires 
+        (user_id, year, month, date, time, questionnaire, responses)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        user_id,
+        now.year,
+        now.month,
+        now.day,
+        now.strftime("%H:%M:%S"),
+        questionnaire,
+        json.dumps(responses)
+    ))
+    
+    conn.commit()
+    conn.close()
 
 
 if __name__ == "__main__":

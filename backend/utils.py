@@ -121,6 +121,33 @@ def get_session_responses(session_id: int, questionnaire: str):
     return [row[0] for row in responses]
 
 
+def get_recent_history(session_id: int, limit: int = 5):
+    """Return recent raw responses for a session to preserve conversational momentum"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT questionnaire, question_no, raw_response, gemini_confidence, timestamp
+        FROM responses
+        WHERE session_id = ?
+        ORDER BY timestamp DESC
+        LIMIT ?
+    """, (session_id, limit))
+    rows = cursor.fetchall()
+    conn.close()
+
+    history = []
+    for row in reversed(rows):
+        history.append({
+            "user": row["raw_response"],
+            "bot": f"Answered {row['questionnaire']} Q{row['question_no'] + 1} (confidence={row['gemini_confidence']})",
+            "questionnaire": row["questionnaire"],
+            "question_no": row["question_no"],
+            "confidence": row["gemini_confidence"],
+            "timestamp": row["timestamp"]
+        })
+    return history
+
+
 def calculate_questionnaire_score(session_id: int, questionnaire: str) -> int:
     """Calculate total score for a questionnaire"""
     scores = get_session_responses(session_id, questionnaire)
