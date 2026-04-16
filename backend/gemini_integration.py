@@ -101,7 +101,7 @@ def parse_response_with_gemini(
     question_no: int,
     user_response: str
 ) -> Dict:
-    """Use Gemini to parse user response"""
+    """Use Gemini to parse user response with ReAct chain-of-thought prompting"""
     
     try:
         question = get_question(questionnaire, question_no)
@@ -109,24 +109,61 @@ def parse_response_with_gemini(
         
         opt_text = "\n".join([f"{k}) {v}" for k, v in options.items()])
         
-        prompt = f"""Given the questionnaire question: "{question}"
-Available options:
+        # ReAct Chain-of-Thought Prompting for better reasoning
+        prompt = f"""You are a mental health assessment chatbot. Analyze the user's response using structured reasoning.
+
+CURRENT QUESTION:
+"{question}"
+
+AVAILABLE OPTIONS:
 {opt_text}
 
-User response: "{user_response}"
+USER RESPONSE:
+"{user_response}"
 
-Task: Determine which option (a, b, c, or d) the user intended.
+---
+THINK STEP BY STEP (ReAct Chain-of-Thought):
 
-1. If response clearly matches an option (exact letter, number, or exact phrase), return JSON: 
-   {{"confidence": "high", "option": "a|b|c|d", "reason": "..."}}
+1. OBSERVATION: What exactly did the user write?
+2. RELEVANCE: Is this response attempting to answer about the question topic?
+3. ANALYSIS: Classify the response:
+   - OFF-TOPIC: Ignores question, asks something else, refuses to answer
+   - DIRECT: Clear letter/number/option phrase match
+   - SEMANTIC: Describes feeling/situation matching an option but not explicit
+   - AMBIGUOUS: Unclear, contradictory, or multiple meanings
+4. ACTION: Determine confidence and required action
+5. REASONING: Explain your decision
 
-2. If response is semantically similar to an option, return:
-   {{"confidence": "medium", "option": "b", "reason": "...", "ask_confirm": true}}
+---
+RESPONSE (ONLY VALID JSON):
 
-3. If response is ambiguous or off-topic or user asks multiple options, return:
-   {{"confidence": "low", "action": "clarify", "reason": "..."}}
+IF user is ON-TOPIC and answering:
+  {{
+    "confidence": "high",
+    "option": "a",
+    "reason": "User explicitly said option A or equivalent"
+  }}
+  OR
+  {{
+    "confidence": "medium",
+    "option": "b",
+    "ask_confirm": true,
+    "reason": "User described situation matching option B, need confirmation"
+  }}
+  OR
+  {{
+    "confidence": "low",
+    "reason": "Answer unclear or ambiguous, user needs to choose explicitly"
+  }}
 
-Return ONLY valid JSON, no markdown or extra text."""
+IF user is OFF-TOPIC:
+  {{
+    "confidence": "low",
+    "is_offtopic": true,
+    "reason": "User is asking about something unrelated to the question"
+  }}
+
+Return ONLY the JSON object, no markdown backticks, no extra text."""
 
         model = genai.GenerativeModel("gemini-pro")
         response = model.generate_content(prompt)

@@ -25,12 +25,6 @@ from backend.utils import (
     get_session_responses,
     option_to_score
 )
-import time
-import logging
-
-# Setup logging for latency tracking
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Mental Health Assessment API")
 
@@ -48,7 +42,6 @@ init_db()
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """Main chat endpoint - processes user message and returns next question"""
-    request_start = time.time()
     
     user_id = request.user_id.strip()
     message = request.message.strip()
@@ -56,14 +49,11 @@ async def chat(request: ChatRequest):
     if not user_id or not message:
         raise HTTPException(status_code=400, detail="user_id and message required")
     
-    # CHECKPOINT 1: User & Session Setup
-    setup_start = time.time()
     get_or_create_user(user_id)
     session = get_user_session(user_id)
     session_id = session['session_id']
     tracker = get_tracker(session_id)
     current_state = session['current_state']
-    logger.info(f"[SETUP] {time.time() - setup_start:.3f}s | State: {current_state} | Progress: {tracker.get('phq4_progress', -1)}")
     
     # ==================== INITIAL OFFER ====================
     if current_state == "PHQ4" and tracker['phq4_progress'] == 0 and message.lower() not in ["a", "b", "c", "d"]:
@@ -106,14 +96,11 @@ async def chat(request: ChatRequest):
     
     # ==================== HANDLE PHQ4 ====================
     if current_state == "PHQ4" and tracker['phq4_progress'] >= -1 and tracker['phq4_progress'] < 4:
-        # CHECKPOINT 2: Gemini Parse (LATENCY HOTSPOT)
-        parse_start = time.time()
         parse_result = parse_response_with_gemini(
             "PHQ4", 
             tracker['phq4_progress'] if tracker['phq4_progress'] >= 0 else 0,
             message
         )
-        logger.info(f"[GEMINI_PARSE] {time.time() - parse_start:.3f}s | Confidence: {parse_result.get('confidence')}")
         
         # OFF-TOPIC: User not answering the question
         if parse_result.get('is_offtopic'):
@@ -173,7 +160,6 @@ async def chat(request: ChatRequest):
             message,
             parse_result.get('confidence', 'unknown')
         )
-        logger.info(f"[DB_SAVE] Saved response for PHQ4 Q{question_idx+1}")
         
         # UPDATE PROGRESS: Set to 1 after first answer (not 0!)
         if tracker['phq4_progress'] == -1:
@@ -189,12 +175,9 @@ async def chat(request: ChatRequest):
         
         # CHECK IF COMPLETE
         if tracker['phq4_progress'] == 4:
-            # CHECKPOINT 4: Score Calculation
-            calc_start = time.time()
             phq4_score = calculate_questionnaire_score(session_id, "PHQ4")
             phq4_severity = get_severity_level("PHQ4", phq4_score)
             save_score(session_id, "PHQ4", phq4_score, phq4_severity)
-            logger.info(f"[CALC_SCORE] {time.time() - calc_start:.3f}s | Score: {phq4_score}/{QUESTIONNAIRES['PHQ4']}")
             
             responses = get_session_responses(session_id, "PHQ4")
             anxiety_score = responses[0] + responses[1]
@@ -212,55 +195,38 @@ async def chat(request: ChatRequest):
             conn.commit()
             conn.close()
             
-            # Generate intelligent summary message
-            summary = f"✅ **Thank you for your responses!**\n\n"
-            
-            if phq4_score <= 2:
-                summary += "**Good news:** Your screening shows minimal symptoms. You're doing well! Continue with your healthy habits and self-care practices.\n\n"
-            elif phq4_score <= 5:
-                summary += f"**Assessment:** You appear to have some mild symptoms. A more detailed assessment can help understand better.\n\n"
-            else:
-                summary += f"**Assessment:** Your responses suggest notable symptoms that deserve attention.\n\n"
-            
-            summary += f"**Your PHQ-4 Score:** {phq4_score}/12 ({phq4_severity})\n\n"
-            
-            # Determine next steps
-            if gad7_needed and phq9_needed:
-                summary += "📋 **Next Steps:** Would you like to answer questions about **anxiety** and **depression** for a complete assessment?\n\nThis will take about 5 minutes and give us a clearer picture."
-                next_state = "PHQ4_RESULTS_BOTH"
-            elif gad7_needed:
-                summary += "📋 **Next Steps:** It seems anxiety might be a concern. Would you like to answer more detailed questions about **anxiety**?\n\nThis will take about 2 minutes."
-                next_state = "PHQ4_RESULTS_GAD7"
+            if gad7_needed:
+                update_session_state(session_id, "GAD7")
+                return ChatResponse(
+                    session_id=session_id,
+                    current_state="GAD7",
+                    next_question=f"✅ **PHQ-4 Complete** (Score: {phq4_score}/12 - {phq4_severity})\n\n---\n\n**Starting GAD-7 Assessment (7 questions)**\n\n**Question 1 of 7 - GAD-7**\n\n{format_question_with_options('GAD7', 0)}",
+                    question_number=1,
+                    total_questions=7,
+                    progress_message="Starting GAD-7 Assessment"
+                )
             elif phq9_needed:
-                summary += "📋 **Next Steps:** It seems depression might be a concern. Would you like to answer more detailed questions about **depression**?\n\nThis will take about 3 minutes."
-                next_state = "PHQ4_RESULTS_PHQ9"
+                update_session_state(session_id, "PHQ9")
+                return ChatResponse(
+                    session_id=session_id,
+                    current_state="PHQ9",
+                    next_question=f"✅ **PHQ-4 Complete** (Score: {phq4_score}/12 - {phq4_severity})\n\n---\n\n**Starting PHQ-9 Assessment (9 questions)**\n\n**Question 1 of 9 - PHQ-9**\n\n{format_question_with_options('PHQ9', 0)}",
+                    question_number=1,
+                    total_questions=9,
+                    progress_message="Starting PHQ-9 Assessment"
+                )
             else:
-                summary += "Your assessment is complete. Thank you for participating!"
                 update_session_state(session_id, "COMPLETED")
                 end_session(session_id)
+                recommendations = get_recommendations("PHQ4", phq4_score, phq4_severity)
                 return ChatResponse(
                     session_id=session_id,
                     current_state="COMPLETED",
-                    next_question=summary,
+                    next_question=f"✅ **Assessment Complete!**\n\n**PHQ-4 Score: {phq4_score}/12 ({phq4_severity})**\n\nYour screening shows minimal symptoms. Keep up healthy habits!\n\n💡 **Recommendations:**\n" + "\n".join([f"• {r}" for r in recommendations]),
                     question_number=0,
                     total_questions=0,
                     progress_message="Assessment Complete"
                 )
-            
-            # Update to results state (waiting for user permission)
-            update_session_state(session_id, next_state)
-            logger.info(f"[STATE_CHANGE] PHQ4 → {next_state}")
-            
-            return ChatResponse(
-                session_id=session_id,
-                current_state=next_state,
-                next_question=summary,
-                question_number=0,
-                total_questions=0,
-                progress_message="Awaiting user permission to continue",
-                clarification_needed=True,
-                clarification_prompt="Reply 'yes' to continue or 'no' to end"
-            )
         else:
             question_idx = tracker['phq4_progress']
             return ChatResponse(
@@ -272,75 +238,9 @@ async def chat(request: ChatRequest):
                 progress_message=f"Question {question_idx + 1} of 4"
             )
     
-    # ==================== HANDLE PHQ4 RESULTS STATES (Waiting for permission) ====================
-    if current_state in ["PHQ4_RESULTS_BOTH", "PHQ4_RESULTS_GAD7", "PHQ4_RESULTS_PHQ9"]:
-        if message.lower() in ["yes", "y", "ok", "start"]:
-            # User agreed - transition to appropriate questionnaire
-            if current_state == "PHQ4_RESULTS_BOTH":
-                # Start with GAD7 first
-                update_session_state(session_id, "GAD7")
-                logger.info(f"[USER_CONSENT] {user_id} agreed to GAD7+PHQ9")
-                return ChatResponse(
-                    session_id=session_id,
-                    current_state="GAD7",
-                    next_question=f"**GAD-7 Assessment: Anxiety Screening (7 questions)**\n\n**Question 1 of 7 - GAD-7**\n\n{format_question_with_options('GAD7', 0)}",
-                    question_number=1,
-                    total_questions=7,
-                    progress_message="Starting GAD-7 Assessment"
-                )
-            elif current_state == "PHQ4_RESULTS_GAD7":
-                update_session_state(session_id, "GAD7")
-                logger.info(f"[USER_CONSENT] {user_id} agreed to GAD7 only")
-                return ChatResponse(
-                    session_id=session_id,
-                    current_state="GAD7",
-                    next_question=f"**GAD-7 Assessment: Anxiety Screening (7 questions)**\n\n**Question 1 of 7 - GAD-7**\n\n{format_question_with_options('GAD7', 0)}",
-                    question_number=1,
-                    total_questions=7,
-                    progress_message="Starting GAD-7 Assessment"
-                )
-            else:  # PHQ4_RESULTS_PHQ9
-                update_session_state(session_id, "PHQ9")
-                logger.info(f"[USER_CONSENT] {user_id} agreed to PHQ9 only")
-                return ChatResponse(
-                    session_id=session_id,
-                    current_state="PHQ9",
-                    next_question=f"**PHQ-9 Assessment: Depression Screening (9 questions)**\n\n**Question 1 of 9 - PHQ-9**\n\n{format_question_with_options('PHQ9', 0)}",
-                    question_number=1,
-                    total_questions=9,
-                    progress_message="Starting PHQ-9 Assessment"
-                )
-        elif message.lower() in ["no", "n", "skip", "end"]:
-            # User declined
-            update_session_state(session_id, "COMPLETED")
-            end_session(session_id)
-            logger.info(f"[USER_DECLINED] {user_id} declined further assessment")
-            return ChatResponse(
-                session_id=session_id,
-                current_state="COMPLETED",
-                next_question="Thank you for completing the PHQ-4 assessment. Your results have been saved. Feel free to return anytime for a complete assessment.",
-                question_number=0,
-                total_questions=0,
-                progress_message="Session ended by user"
-            )
-        else:
-            # Repeat the permission request
-            return ChatResponse(
-                session_id=session_id,
-                current_state=current_state,
-                next_question="Please reply **'yes'** to continue with the assessment or **'no'** to finish.",
-                question_number=0,
-                total_questions=0,
-                progress_message="Awaiting response",
-                clarification_needed=True,
-                clarification_prompt="Reply 'yes' or 'no'"
-            )
-    
     # ==================== HANDLE GAD7 ====================
     if current_state == "GAD7" and tracker['gad7_progress'] < 7:
-        parse_start = time.time()
         parse_result = parse_response_with_gemini("GAD7", tracker['gad7_progress'], message)
-        logger.info(f"[GEMINI_PARSE] {time.time() - parse_start:.3f}s | GAD7")
         
         if parse_result.get('is_offtopic') or parse_result.get('confidence') == 'low':
             return ChatResponse(
@@ -361,9 +261,7 @@ async def chat(request: ChatRequest):
         tracker = get_tracker(session_id)
         
         if tracker['gad7_progress'] == 7:
-            score_start = time.time()
             gad7_score = calculate_questionnaire_score(session_id, "GAD7")
-            logger.info(f"[SCORE_CALC] {time.time() - score_start:.3f}s | GAD7 score={gad7_score}")
             gad7_severity = get_severity_level("GAD7", gad7_score)
             save_score(session_id, "GAD7", gad7_score, gad7_severity)
             
@@ -401,9 +299,7 @@ async def chat(request: ChatRequest):
     
     # ==================== HANDLE PHQ9 ====================
     if current_state == "PHQ9" and tracker['phq9_progress'] < 9:
-        parse_start = time.time()
         parse_result = parse_response_with_gemini("PHQ9", tracker['phq9_progress'], message)
-        logger.info(f"[GEMINI_PARSE] {time.time() - parse_start:.3f}s | PHQ9")
         
         if parse_result.get('is_offtopic') or parse_result.get('confidence') == 'low':
             return ChatResponse(
@@ -424,9 +320,7 @@ async def chat(request: ChatRequest):
         tracker = get_tracker(session_id)
         
         if tracker['phq9_progress'] == 9:
-            score_start = time.time()
             phq9_score = calculate_questionnaire_score(session_id, "PHQ9")
-            logger.info(f"[SCORE_CALC] {time.time() - score_start:.3f}s | PHQ9 score={phq9_score}")
             phq9_severity = get_severity_level("PHQ9", phq9_score)
             save_score(session_id, "PHQ9", phq9_score, phq9_severity)
             
@@ -474,8 +368,6 @@ async def chat(request: ChatRequest):
                 progress_message=f"Question {tracker['phq9_progress'] + 1} of 9"
             )
     
-    total_time = time.time() - request_start
-    logger.warning(f"[TOTAL_REQUEST_TIME] {total_time:.3f}s | State: {current_state}")
     raise HTTPException(status_code=400, detail="Invalid state")
 
 
